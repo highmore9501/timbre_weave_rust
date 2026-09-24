@@ -1,0 +1,32 @@
+[package]
+name = "timbre_weave"
+version = "0.1.0"
+edition = "2024"
+description = "按演奏可行性把 midi 音符分配到自选乐器编制的多轨分轨工具"
+license = "MIT"
+
+[[bin]]
+name = "timbre_weave"
+path = "src/main.rs"
+
+[lib]
+name = "timbre_weave"
+path = "src/lib.rs"
+
+[dependencies]
+# GUI
+eframe = "0.33.0"
+egui_extras = "0.33.0"
+# midi 读写
+midly = "0.5.3"
+# 配置 / 词典
+serde = { version = "1.0.228", features = ["derive", "rc"] }
+serde_json = "1.0.145"
+# 文件对话框
+rfd = "0.15.4"
+# 日志
+env_logger = "0.11.8"
+# 路径规范化（Windows 下的 \\?\ 前缀处理）
+dunce = "1.0.5"
+# 系统语言检测
+sys-locale = "0.3"
