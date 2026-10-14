@@ -5,7 +5,7 @@
 pub struct StageTimings {
     /// 读取与解析源 midi
     pub read_micros: f64,
-    /// 时间重叠分组
+    /// 按起点分组（同时发声的音符归为一组）
     pub grouping_micros: f64,
     /// 组内归一化（八度折叠 / 同音去重 / 八度合并 / 丢弃）
     pub normalize_micros: f64,
@@ -72,13 +72,15 @@ pub struct SplitReport {
     pub output_path: String,
     /// 读入的源音符数
     pub source_notes: usize,
-    /// 音符组数
+    /// 音符组数（同一个时刻发声的音符算一组）
     pub onset_groups: usize,
     /// 写回的音符数
     pub written_notes: usize,
     /// 音域外八度折叠数
     pub octave_folded: usize,
-    /// 八度合并 / 同音去重数
+    /// 同音去重数（同一个时刻的重复音被合掉的数量）
+    pub pitch_merged: usize,
+    /// 八度合并数（同一时刻放不下、被并进八度伙伴的数量）
     pub octave_merged: usize,
     /// 丢弃数（正常为 0）
     pub dropped_notes: usize,

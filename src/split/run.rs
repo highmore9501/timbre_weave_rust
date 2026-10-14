@@ -1,7 +1,7 @@
 //! 分轨总流程：读源轨 → 分组 → 归一化 → 分配 → 写出 → 汇总
 
 use crate::midi::grouping::{
-    MAX_GROUP_NOTES, NormalizeContext, NormalizeStats, group_by_overlap, normalize_group,
+    MAX_GROUP_NOTES, NormalizeContext, NormalizeStats, group_by_onset, normalize_group,
 };
 use crate::midi::reader::{load_midi_file, read_track_notes};
 use crate::midi::writer::{
@@ -9,9 +9,7 @@ use crate::midi::writer::{
 };
 use crate::split::assign::{DEFAULT_POOL_SIZE, assign_group};
 use crate::split::cost::range_cost;
-use crate::split::instrument::{
-    EnsembleSlot, crowded_channels, ensemble_capacity, ensemble_union_range,
-};
+use crate::split::instrument::{EnsembleSlot, crowded_channels, ensemble_union_range};
 use crate::split::report::{SlotReport, SplitReport, StageTimings};
 
 /// 分轨请求
@@ -88,7 +86,6 @@ pub fn run_split(request: &SplitRequest) -> Result<SplitReport, SplitError> {
         return Err(SplitError::NoInstrument);
     }
 
-    let total_capacity = ensemble_capacity(&active_ensemble);
     let Some(union_range) = ensemble_union_range(&active_ensemble) else {
         return Err(SplitError::NoInstrument);
     };
@@ -111,7 +108,7 @@ pub fn run_split(request: &SplitRequest) -> Result<SplitReport, SplitError> {
 
     // === 2. 分组（计时） ===
     let stage_start = std::time::Instant::now();
-    let groups = group_by_overlap(&source_notes, request.onset_tolerance);
+    let groups = group_by_onset(&source_notes, request.onset_tolerance);
     let grouping_micros = stage_start.elapsed().as_secs_f64() * 1_000_000.0;
 
     // 编制里每件乐器的可演奏音域（归一化阶段用来剔除"谁都演奏不了"的音）
@@ -124,12 +121,14 @@ pub fn run_split(request: &SplitRequest) -> Result<SplitReport, SplitError> {
     let normalize_context = NormalizeContext {
         union_lo: union_range.lo,
         union_hi: union_range.hi,
-        total_capacity,
         playable_ranges: &playable_ranges,
     };
     let mut normalize_stats = NormalizeStats::default();
     let mut voice_notes: Vec<Vec<VoiceOutputNote>> = vec![Vec::new(); active_ensemble.len()];
     let mut slot_doubled_notes: Vec<usize> = vec![0; active_ensemble.len()];
+    // 每件乐器"此刻仍占着"的音（结束 tick, 音高）：分配完一组把新音挂上，进下一组前清掉已经结束的。
+    // 这就是取代"按时间重叠连通分组"的那份时间信息。
+    let mut slot_pending: Vec<Vec<(u64, i32)>> = vec![Vec::new(); active_ensemble.len()];
     let mut normalize_micros: f64 = 0.0;
     let mut assign_micros: f64 = 0.0;
     let mut report = SplitReport {
@@ -141,12 +140,38 @@ pub fn run_split(request: &SplitRequest) -> Result<SplitReport, SplitError> {
     for group in &groups {
         let anchor_tick = group[0].start_tick;
 
+        // 先摘掉此刻已经结束的音，剩下的就是与本组同时发声、必须算进同时发音数的占用
+        let occupied_keys: Vec<Vec<i32>> = slot_pending
+            .iter_mut()
+            .map(|pending| {
+                pending.retain(|(end_tick, _key)| *end_tick > anchor_tick);
+                pending.iter().map(|(_end_tick, key)| *key).collect()
+            })
+            .collect();
+        let available_capacity: usize = active_ensemble
+            .iter()
+            .enumerate()
+            .map(|(slot_index, slot)| {
+                (slot.max_polyphony() as usize).saturating_sub(occupied_keys[slot_index].len())
+            })
+            .sum();
+
         let stage_start = std::time::Instant::now();
-        let normalized = normalize_group(group, &normalize_context, &mut normalize_stats);
+        let normalized = normalize_group(
+            group,
+            &normalize_context,
+            available_capacity,
+            &mut normalize_stats,
+        );
         normalize_micros += stage_start.elapsed().as_secs_f64() * 1_000_000.0;
 
         let stage_start = std::time::Instant::now();
-        let assignment_result = assign_group(&normalized, &active_ensemble, request.effective_pool_size());
+        let assignment_result = assign_group(
+            &normalized,
+            &active_ensemble,
+            &occupied_keys,
+            request.effective_pool_size(),
+        );
         assign_micros += stage_start.elapsed().as_secs_f64() * 1_000_000.0;
 
         match assignment_result {
@@ -163,8 +188,15 @@ pub fn run_split(request: &SplitRequest) -> Result<SplitReport, SplitError> {
                     report.doubled_notes += assignment.doubled_notes;
                 }
                 for (slot_index, note_indices) in assignment.voice_note_indices.iter().enumerate() {
-                    if note_indices.len() >= 2 {
-                        slot_doubled_notes[slot_index] += note_indices.len();
+                    if !note_indices.is_empty() {
+                        // 这一刻该乐器本来还占着音 → 本组这几个音全算叠音；
+                        // 否则只有第二个音起才算叠音（弦乐双音）。
+                        let held_notes = occupied_keys[slot_index].len();
+                        slot_doubled_notes[slot_index] += if held_notes > 0 {
+                            note_indices.len()
+                        } else {
+                            note_indices.len() - 1
+                        };
                     }
                     for &note_index in note_indices {
                         let note = normalized[note_index];
@@ -174,11 +206,12 @@ pub fn run_split(request: &SplitRequest) -> Result<SplitReport, SplitError> {
                             start_tick: anchor_tick,
                             end_tick: note.end_tick,
                         });
+                        slot_pending[slot_index].push((note.end_tick, note.key));
                     }
                 }
             }
             None => {
-                // 这条分支理论上不可达：归一化已保证组内音数 ≤ 总容量、且每个音都有乐器能演。
+                // 这条分支理论上不可达：归一化已按"此刻腾得出的容量"卡过、且每个音都有乐器能演。
                 // 真到了这里，把整组按力度丢音（**不**硬塞给某件乐器——那会突破 max_polyphony，
                 // 正是"单声部乐器出现叠音"的根源）。
                 if !report.used_fallback {
@@ -191,6 +224,7 @@ pub fn run_split(request: &SplitRequest) -> Result<SplitReport, SplitError> {
     }
 
     report.octave_folded = normalize_stats.octave_folded;
+    report.pitch_merged = normalize_stats.pitch_merged;
     report.octave_merged = normalize_stats.octave_merged;
     report.dropped_notes = normalize_stats.dropped;
 
@@ -303,6 +337,7 @@ pub fn run_split(request: &SplitRequest) -> Result<SplitReport, SplitError> {
         report.onset_groups,
         report.written_notes,
         report.octave_folded,
+        report.pitch_merged,
         report.octave_merged,
         report.dropped_notes
     ));

@@ -187,6 +187,12 @@ impl TimbreWeaveApp {
                     widgets::key_value_row(
                         ui,
                         colors,
+                        &crate::t!("ui.report.pitch_merged"),
+                        &report.pitch_merged.to_string(),
+                    );
+                    widgets::key_value_row(
+                        ui,
+                        colors,
                         &crate::t!("ui.report.octave_merged"),
                         &report.octave_merged.to_string(),
                     );

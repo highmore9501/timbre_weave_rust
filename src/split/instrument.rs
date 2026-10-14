@@ -813,6 +813,11 @@ pub fn ensemble_union_range(ensemble: &[EnsembleSlot]) -> Option<PitchRange> {
 }
 
 /// 编制总同时发音容量（Σ max_polyphony）
+///
+/// 这是"一件乐器都没被占用时"的容量。实际判定用的是**此刻**腾得出的位数
+/// （总容量 − 每件乐器仍占着的音数，见 `split::run`），因为同一件乐器上一刻
+/// 还在响的音会占掉它的位子。挑编制时按这个总数估算仍然有效：
+/// 只要它不小于"音频里同时响的音最多有几个"，就一定不会因为放不下而合并或丢音。
 pub fn ensemble_capacity(ensemble: &[EnsembleSlot]) -> usize {
     ensemble
         .iter()

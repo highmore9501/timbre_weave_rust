@@ -19,10 +19,16 @@
 //! 它最终分到的音集，与分配顺序无关。所以"到目前为止累计得分最小"就是正确的剪枝依据，
 //! 和 key_ripple 里 `current_entropy + 本步增量` 是同一个道理。
 //!
-//! ## 硬约束：`max_polyphony` 绝不可超
+//! ## 硬约束：`max_polyphony` 绝不可超（按时刻算）
 //!
 //! 单声部乐器（木管 / 铜管 / 打击乐）的 `max_polyphony = 1`，**任何情况下都不会拿到第二个音**。
 //! 展开时"该乐器是否还有空位"是第一道判断，两趟展开（见下）都遵守它。
+//!
+//! 空位的口径是**这一刻**：调用方把"每件乐器此刻仍占着的音高"（上一组留下、还没结束的音）
+//! 一起传进来，占用数 + 本组已分给它的音数 必须小于 `max_polyphony`。
+//! 因为分组只按起点划分（同一时刻的音符才在同一组），所以"占着"指的就是与本组同时发声。
+//! 这也是本模块能取代"把时值重叠的音符并成一组"那种做法的原因：
+//! 时间关系由这里的占用表处理，组不必再为一个长音拖着一长串后来的音符。
 //!
 //! ## 两趟展开：让自己永远不会失败
 //!
@@ -61,6 +67,13 @@ pub const DEFAULT_POOL_SIZE: usize = 256;
 
 /// 候选池的最小可用大小（再小就退化成贪心）
 pub const MIN_POOL_SIZE: usize = 8;
+
+/// "音域外"音符在**增量**代价里的罚分
+///
+/// [`crate::split::cost::subset_cost`] 对音域外的音返回 `INFINITY`（第一趟展开的硬约束靠它），
+/// 但增量是"收下之后 − 收下之前"，两个 `INFINITY` 相减会得到 `NaN`。
+/// 这里换成一个有限的、比任何正常组合都大的罚分（正常组合最多 `MAX_PENALTY × alpha × 音数`）。
+const OUT_OF_RANGE_INCREMENT: f64 = 64.0;
 
 /// 一个分配方案的分层得分（比较时先比前面的字段）
 #[derive(Debug, Clone, Copy)]
@@ -216,13 +229,17 @@ pub struct GroupAssignment {
 
 /// 用候选池求解一个音符组的分配方案
 ///
-/// 返回 `None` 只有一种可能：**组内音符数超过编制总同时发音容量**
-/// （这是硬约束，必须由归一化阶段的丢弃来满足，见 `midi::grouping::normalize_group`）。
+/// `occupied_keys[slot_index]` 是这一刻该乐器**仍占着**的音高（上一组留下、此刻还没结束的），
+/// 它们与本组的音同时发声，所以要计入该乐器的同时发音数。
+///
+/// 返回 `None` 只有一种可能：**本组音符数超过此刻还能腾出的同时发音位总数**
+/// （这是硬约束，必须由归一化阶段的合并/丢弃来满足，见 `midi::grouping::normalize_group`）。
 /// 除此之外求解器一定能给出把每个音都安置好的方案——必要时允许"强制塞进音域外乐器"，
 /// 并计入诊断的 `forced_notes`。
 pub fn assign_group(
     notes: &[GroupNote],
     ensemble: &[EnsembleSlot],
+    occupied_keys: &[Vec<i32>],
     pool_size: usize,
 ) -> Option<GroupAssignment> {
     if notes.is_empty() {
@@ -232,12 +249,16 @@ pub fn assign_group(
         });
     }
 
-    // 硬约束：总同时发音容量必须够（不够就该在归一化阶段丢音，不应该走到这里）
-    let total_capacity: usize = ensemble
+    // 硬约束：此刻腾得出的同时发音位必须够（不够就该在归一化阶段合并/丢音，不应该走到这里）
+    let free_capacity: usize = ensemble
         .iter()
-        .map(|slot| slot.max_polyphony() as usize)
+        .enumerate()
+        .map(|(instrument_index, slot)| {
+            let occupied = occupied_keys.get(instrument_index).map_or(0, Vec::len);
+            (slot.max_polyphony() as usize).saturating_sub(occupied)
+        })
         .sum();
-    if notes.len() > total_capacity {
+    if notes.len() > free_capacity {
         return None;
     }
 
@@ -265,7 +286,7 @@ pub fn assign_group(
         // ---- 第一趟：只考虑真的能演奏这个音的乐器 ----
         for candidate in &current_candidates {
             for instrument_index in 0..ensemble.len() {
-                if !can_place(candidate, instrument_index, ensemble) {
+                if !can_place(candidate, instrument_index, ensemble, occupied_keys) {
                     continue;
                 }
                 if range_cost(&ensemble[instrument_index], notes[note_index].key).is_none() {
@@ -277,6 +298,7 @@ pub fn assign_group(
                     note_index,
                     &ensemble[instrument_index],
                     notes,
+                    occupied_keys,
                     false,
                 ));
             }
@@ -290,7 +312,7 @@ pub fn assign_group(
             for candidate in &current_candidates {
                 let mut nearest: Option<(i32, usize)> = None;
                 for instrument_index in 0..ensemble.len() {
-                    if !can_place(candidate, instrument_index, ensemble) {
+                    if !can_place(candidate, instrument_index, ensemble, occupied_keys) {
                         continue;
                     }
                     let distance = range_distance(&ensemble[instrument_index], notes[note_index].key);
@@ -305,6 +327,7 @@ pub fn assign_group(
                         note_index,
                         &ensemble[instrument_index],
                         notes,
+                        occupied_keys,
                         true,
                     ));
                 }
@@ -356,9 +379,19 @@ pub fn assign_group(
     })
 }
 
-/// 该乐器在这个部分解里是否还有空位（`max_polyphony` 是硬上限）
-fn can_place(candidate: &Candidate, instrument_index: usize, ensemble: &[EnsembleSlot]) -> bool {
-    candidate.assignments[instrument_index].len() < ensemble[instrument_index].max_polyphony() as usize
+/// 该乐器在这个部分解里是否还有空位
+///
+/// 空位按"这一刻"算：此刻仍占着的音数（`occupied_keys`）+ 本组已分给它的音数
+/// 必须小于 `max_polyphony`（硬上限）。
+fn can_place(
+    candidate: &Candidate,
+    instrument_index: usize,
+    ensemble: &[EnsembleSlot],
+    occupied_keys: &[Vec<i32>],
+) -> bool {
+    let occupied = occupied_keys.get(instrument_index).map_or(0, Vec::len);
+    let limit = ensemble[instrument_index].max_polyphony() as usize;
+    occupied + candidate.assignments[instrument_index].len() < limit
 }
 
 /// 音符到可演奏音域的距离（域内为 0），用于第二趟挑"最近的乐器"
@@ -379,30 +412,39 @@ fn expand_candidate(
     note_index: usize,
     slot: &EnsembleSlot,
     notes: &[GroupNote],
+    occupied_keys: &[Vec<i32>],
     is_forced: bool,
 ) -> Candidate {
     let key = notes[note_index].key;
 
-    // 该乐器追加这个音之后的增量得分
-    let note_count_after = candidate.assignments[instrument_index].len() + 1;
-    let incremental_cost = match note_count_after {
-        1 => range_cost(slot, key).unwrap_or(f64::INFINITY),
-        _ => {
-            // 叠音：整集代价重算（组内每件乐器最多 2 个音，重算比维护边际更直白）
-            let mut keys: Vec<i32> = candidate.assignments[instrument_index]
-                .iter()
-                .map(|&existing| notes[existing].key)
-                .collect();
-            keys.push(key);
-            let cost_after = subset_cost(slot, &keys);
-            let cost_before = subset_cost(slot, &keys[..keys.len() - 1]);
-            cost_after - cost_before
-        }
+    // 该乐器收下这个音**之前**的音集：此刻仍占着的音 + 本组已分给它的音
+    // （两者都与这个音同时发声，所以代价与"叠音"判定都要把它们算上）
+    let mut keys_before: Vec<i32> = occupied_keys
+        .get(instrument_index)
+        .map_or(Vec::new(), |held| held.clone());
+    keys_before.extend(
+        candidate.assignments[instrument_index]
+            .iter()
+            .map(|&assigned_index| notes[assigned_index].key),
+    );
+
+    // 增量代价 = 收下之后的整集代价 − 收下之前的整集代价
+    let cost_before = subset_cost(slot, &keys_before);
+    let mut keys_after = keys_before.clone();
+    keys_after.push(key);
+    let cost_after = subset_cost(slot, &keys_after);
+    // 音集里有"音域外"的音时 subset_cost 给的是 INFINITY，两个 INFINITY 相减是 NaN，
+    // 一旦混进候选池的得分比较，整池排序就会失效，所以这里换成一个有限的大罚分
+    let incremental_cost = if cost_before.is_finite() && cost_after.is_finite() {
+        cost_after - cost_before
+    } else {
+        OUT_OF_RANGE_INCREMENT
     };
 
     let center = slot.comfortable.center();
     let incremental = LayeredScore {
-        doubled_notes: if note_count_after >= 2 { 1 } else { 0 },
+        // 收下这个音之前乐器就不是空的 → 这个音是叠音（和仍在响的音，或本组同伙）
+        doubled_notes: if keys_before.is_empty() { 0 } else { 1 },
         cost: incremental_cost,
         outside_distance: comfort_distance(slot, key),
         center_deviation: (key as f64 - center).powi(2),
