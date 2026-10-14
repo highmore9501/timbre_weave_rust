@@ -169,8 +169,8 @@ impl TimbreWeaveApp {
                             ui.end_row();
 
                             for (slot_index, slot) in self.data.ensemble.iter().enumerate() {
-                                // 通道不显示：它由编制序号自动推导（跳过打击乐保留的 10 号通道），
-                                // 用户不需要手动管它
+                                // 通道不显示：它由本槽位在启用清单里的位次现算（跳过打击乐保留的
+                                // 10 号通道），用户不需要手动管它，也不会沿用源 midi 的通道号
                                 ui.label(slot.track_name());
                                 // GM 音色号内部存 0 基，这里按惯例显示 1 基并标注
                                 ui.label(format!("{}", slot.gm_program() as u16 + 1));

@@ -9,7 +9,9 @@ use crate::midi::writer::{
 };
 use crate::split::assign::{DEFAULT_POOL_SIZE, assign_group};
 use crate::split::cost::range_cost;
-use crate::split::instrument::{EnsembleSlot, crowded_channels, ensemble_union_range};
+use crate::split::instrument::{
+    EnsembleSlot, MAX_SEPARATE_CHANNELS, crowded_channels, ensemble_union_range,
+};
 use crate::split::report::{SlotReport, SplitReport, StageTimings};
 
 /// 分轨请求
@@ -255,7 +257,9 @@ pub fn run_split(request: &SplitRequest) -> Result<SplitReport, SplitError> {
             track_name: slot.track_name(),
             instrument_name: slot.track_name(),
             gm_program: slot.gm_program(),
-            channel: slot.channel,
+            // 输出通道按**启用清单里的位次**现算（第 1 件 → 1 号通道，第 10 件跳过打击乐用的
+            // 10 号通道）：既不沿用源 midi 的通道，也不读任何存下来的旧值。
+            channel: slot.default_output_channel(slot_index),
         };
         let output_notes: Vec<OutputNote> = voice_notes[slot_index]
             .iter()
@@ -293,12 +297,13 @@ pub fn run_split(request: &SplitRequest) -> Result<SplitReport, SplitError> {
     }
     report.slots = slot_reports;
 
-    // 通道复用检查：编制超过 15 件时必然发生（midi 只有 15 个可用通道）
-    report.shared_channels = crowded_channels(&active_ensemble)
+    // 通道复用检查：编制上限就是可用通道数，所以正常情况下一个通道只归一件乐器；
+    // 真出现复用说明编制超过 15 件（midi 只有 15 个可用通道），必须提示——同一端口上会互相覆盖 GM 音色
+    report.shared_channels = crowded_channels(active_ensemble.len())
         .into_iter()
         .map(|(channel, count)| (channel + 1, count))
         .collect();
-    if !report.shared_channels.is_empty() {
+    if active_ensemble.len() > MAX_SEPARATE_CHANNELS {
         let detail: Vec<String> = report
             .shared_channels
             .iter()

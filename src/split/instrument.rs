@@ -149,8 +149,6 @@ pub struct EnsembleSlot {
     pub polyphony_alpha: f64,
     /// 是否参与本次分配
     pub enabled: bool,
-    /// 输出通道（0–15，9 为 GM 打击乐保留位）
-    pub channel: u8,
 }
 
 impl EnsembleSlot {
@@ -177,6 +175,20 @@ impl EnsembleSlot {
     /// GM 音色号（0 基）
     pub fn gm_program(&self) -> u8 {
         self.spec().gm_program
+    }
+
+    /// 本槽位在**启用清单**里的输出通道（0 基）
+    ///
+    /// 通道不存字段、每次从这里现算：存下来就会变成"可以被改动的旧值"，
+    /// 一旦哪条路径忘了刷新（比如编制增删之后），写出的文件里就会有几件乐器
+    /// 挤在同一个通道上、互相覆盖 GM 音色。现算就没有这个失效机会。
+    ///
+    /// `active_position` 是本槽位在启用清单（[`SplitRequest::ensemble`] 过滤 `enabled` 之后）
+    /// 里的下标，所以通道永远从 1 号开始连续排、中间不留空。
+    ///
+    /// [`SplitRequest::ensemble`]: crate::split::run::SplitRequest::ensemble
+    pub fn default_output_channel(&self, active_position: usize) -> u8 {
+        assign_channel(active_position)
     }
 }
 
@@ -703,16 +715,6 @@ pub const ENSEMBLE_PRESETS: &[EnsemblePreset] = &[
     },
 ];
 
-/// 编制上限（含同名多把）
-///
-/// **与 midi 的通道数同步**：midi 只有 16 个通道，索引 9 是 GM 打击乐保留位，
-/// 所以最多 15 件乐器能各自独占一个通道。上限就定 15，这样每件乐器都能拿到独立通道，
-/// 不需要考虑复用通道带来的 GM 音色互相覆盖问题。
-///
-/// （常量的推导关系见 [`MAX_SEPARATE_CHANNELS`]；若将来放宽这个上限，
-/// 就必须处理通道复用，`crowded_channels` 的提示也会重新变得必要。）
-pub const MAX_ENSEMBLE_SIZE: usize = 15;
-
 /// midi 通道总数
 pub const MIDI_CHANNEL_COUNT: usize = 16;
 
@@ -722,15 +724,24 @@ pub const PERCUSSION_CHANNEL: usize = 9;
 /// 能各自独占一个通道的乐器数上限（16 个通道去掉打击乐保留位）
 pub const MAX_SEPARATE_CHANNELS: usize = MIDI_CHANNEL_COUNT - 1;
 
+/// 编制上限（含同名多把）
+///
+/// **直接等于可用通道数** [`MAX_SEPARATE_CHANNELS`]：midi 只有 16 个通道，索引 9 是
+/// GM 打击乐保留位，所以最多 15 件乐器能各自独占一个通道。上限就定 15，这样每件乐器
+/// 都能拿到独立通道，不需要考虑复用通道带来的 GM 音色互相覆盖问题。
+///
+/// （若将来放宽这个上限，就必须处理通道复用，`crowded_channels` 的提示也会重新变得必要。）
+pub const MAX_ENSEMBLE_SIZE: usize = MAX_SEPARATE_CHANNELS;
+
 /// 按乐器 id 查预置定义
 pub fn find_instrument(id: &str) -> Option<&'static InstrumentSpec> {
     INSTRUMENT_POOL.iter().find(|spec| spec.id == id)
 }
 
-/// 编排出输出通道：按编制序号从 0 递增，**跳过索引 9（1 基的 10 号通道，GM 打击乐保留位）**
+/// 编排出输出通道：按**启用清单里的位次**从 0 递增，**跳过索引 9（1 基的 10 号通道，GM 打击乐保留位）**
 ///
-/// 通道由编制序号直接推导，所以用户不需要（也无法）手动设置通道：
-/// 第 1 件 → 1 号通道，第 9 件 → 9 号通道，第 10 件 → **11 号通道**（跳过 10），
+/// 通道由位次直接推导，所以用户不需要（也无法）手动设置通道，更不会从源 midi 里
+/// 沿用原轨的通道号：第 1 件 → 1 号通道，第 9 件 → 9 号通道，第 10 件 → **11 号通道**（跳过 10），
 /// 第 11 件 → 12 号通道 …… 到第 15 件 → 16 号通道正好用完 15 个可用通道。
 ///
 /// 编制上限 [`MAX_ENSEMBLE_SIZE`] 已经与可用通道数（[`MAX_SEPARATE_CHANNELS`]）对齐，
@@ -745,14 +756,13 @@ pub fn assign_channel(slot_position: usize) -> u8 {
 
 /// 找出被多件乐器共用的通道（这些乐器在同一个 midi 端口上会共用 GM 音色）
 ///
+/// 入参是**启用清单的件数**而不是槽位表：通道本来就由位次现算（见 [`assign_channel`]），
+/// 所以"会不会撞通道"只取决于件数，不再依赖任何存下来的通道字段。
 /// 返回 `(通道号, 该通道上的乐器数)`，按通道升序。
-pub fn crowded_channels(ensemble: &[EnsembleSlot]) -> Vec<(u8, usize)> {
+pub fn crowded_channels(active_instrument_count: usize) -> Vec<(u8, usize)> {
     let mut usage: Vec<usize> = vec![0; MIDI_CHANNEL_COUNT];
-    for slot in ensemble.iter().filter(|slot| slot.enabled) {
-        let channel = slot.channel as usize;
-        if channel < MIDI_CHANNEL_COUNT {
-            usage[channel] += 1;
-        }
+    for slot_position in 0..active_instrument_count {
+        usage[assign_channel(slot_position) as usize] += 1;
     }
     usage
         .into_iter()
@@ -781,7 +791,6 @@ pub fn build_ensemble(instrument_ids: &[&str]) -> (Vec<EnsembleSlot>, Vec<String
             .iter()
             .filter(|slot| slot.spec_index == spec_index)
             .count();
-        let channel = assign_channel(slots.len());
         slots.push(EnsembleSlot {
             spec_index,
             ordinal,
@@ -790,7 +799,6 @@ pub fn build_ensemble(instrument_ids: &[&str]) -> (Vec<EnsembleSlot>, Vec<String
             comfortable: spec.comfortable,
             polyphony_alpha: spec.polyphony_alpha,
             enabled: true,
-            channel,
         });
     }
 

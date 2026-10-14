@@ -91,7 +91,7 @@
   "ui.report.pool_peak_size": "Peak pool entries",
   "ui.report.pool_saturated": "Groups pruned by pool limit",
   "ui.report.shared_channels": "Shared channels",
-  "ui.report.shared_channels_warning": "{} instruments share channels (more than 15 instruments; MIDI only has 15 usable channels): they overwrite each other's GM program on one port — export in two batches instead",
+  "ui.report.shared_channels_warning": "{} instruments share channels: the ensemble exceeds 15 players (MIDI has only 15 usable channels — channel 10 is reserved for percussion). Instruments on one channel overwrite each other's GM program on one port",
   "ui.report.pool_saturated_warning": "{} onset groups filled the candidate pool (pruning happened); raise the pool size for more accuracy",
   "ui.report.no_result": "No result yet",
   "ui.report.output_path": "Output file",

@@ -2,7 +2,7 @@
 
 use crate::midi::reader::{TrackInfo, load_midi_file, scan_tracks};
 use crate::split::eval::{EvaluationReport, evaluate_tracks};
-use crate::split::instrument::{EnsembleSlot, INSTRUMENT_POOL, assign_channel};
+use crate::split::instrument::{EnsembleSlot, INSTRUMENT_POOL};
 use crate::split::report::SplitReport;
 use crate::ui::midi_panel::Quantization;
 use crate::ui::theme::{Colors, ThemeManager};
@@ -168,13 +168,15 @@ impl TimbreWeaveApp {
         }
     }
 
-    /// 编制变动后重排同名序号与输出通道
+    /// 编制变动后重排同名序号（Violin 1 / Violin 2 的编号）
+    ///
+    /// 输出通道不在这里维护：它由槽位在启用清单里的位次现算（见
+    /// [`EnsembleSlot::default_output_channel`]），所以增删乐器后不存在"通道值过期"这回事。
     pub fn reindex_ensemble(&mut self) {
         let mut ordinal_by_spec: Vec<usize> = vec![0; INSTRUMENT_POOL.len()];
-        for (slot_position, slot) in self.data.ensemble.iter_mut().enumerate() {
+        for slot in self.data.ensemble.iter_mut() {
             slot.ordinal = ordinal_by_spec[slot.spec_index];
             ordinal_by_spec[slot.spec_index] += 1;
-            slot.channel = assign_channel(slot_position);
         }
     }
 }

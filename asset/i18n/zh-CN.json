@@ -90,7 +90,7 @@
   "ui.report.pool_peak_size": "池内峰值条数",
   "ui.report.pool_saturated": "池满被剪枝的组数",
   "ui.report.shared_channels": "共用通道",
-  "ui.report.shared_channels_warning": "有 {} 件乐器复用了通道（编制超过 15 件，midi 只有 15 个可用通道）：这些乐器在同一个端口上会互相覆盖 GM 音色，建议分两次导出",
+  "ui.report.shared_channels_warning": "有 {} 件乐器复用了通道：编制已经超过 15 件（midi 只有 15 个可用通道，10 号通道留给打击乐）。共通道的乐器在同一个端口上会互相覆盖 GM 音色",
   "ui.report.pool_saturated_warning": "有 {} 个音符组的候选池被填满过（发生过剪枝），把候选池调大可以提高精度",
   "ui.report.no_result": "还没有执行结果",
   "ui.report.output_path": "输出文件",
