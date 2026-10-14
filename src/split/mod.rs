@@ -2,6 +2,8 @@
 
 pub mod assign;
 pub mod cost;
+pub mod eval;
 pub mod instrument;
+pub mod pitch;
 pub mod report;
 pub mod run;

@@ -1,8 +1,11 @@
 //! 编制面板：乐器池勾选、编制表、预设
 
+use crate::split::eval::EvaluationReport;
 use crate::split::instrument::{
-    ENSEMBLE_PRESETS, INSTRUMENT_POOL, InstrumentFamily, MAX_ENSEMBLE_SIZE, build_ensemble,
+    ENSEMBLE_PRESETS, INSTRUMENT_POOL, EnsembleSlot, InstrumentFamily, MAX_ENSEMBLE_SIZE,
+    PitchRange, build_ensemble, ensemble_capacity, ensemble_union_range,
 };
+use crate::split::pitch::key_name;
 use crate::ui::app::TimbreWeaveApp;
 use crate::ui::theme::Colors;
 use crate::ui::widgets;
@@ -190,11 +193,196 @@ impl TimbreWeaveApp {
             }
         });
 
+        ui.add_space(8.0);
+
+        // ---- 卡片 4：编制汇总（实时） ----
+        //
+        // 每一帧都由当前编制现算，所以增删乐器立刻反映在数字上。
+        // 作用是与源轨评估的数字对照：容量够不够、音域盖不盖得住。
+        let summary = ensemble_summary(&self.data.ensemble);
+        widgets::card(ui, colors, &crate::t!("ui.ensemble.summary"), |ui| {
+            if self.data.ensemble.is_empty() {
+                ui.label(
+                    egui::RichText::new(crate::t!("ui.ensemble.summary_empty"))
+                        .small()
+                        .color(colors.text_secondary),
+                );
+                return;
+            }
+
+            // 与源轨评估的对照：只在评估过之后才有意义
+            let target = self.evaluation.as_ref();
+            let value_color = match target {
+                Some(target) if !coverage_verdict(target, &summary).all_ok() => {
+                    colors.warning_text
+                }
+                _ => colors.text_primary,
+            };
+
+            egui::Grid::new("ensemble_summary_grid")
+                .num_columns(2)
+                .spacing([10.0, 4.0])
+                .show(ui, |ui| {
+                    widgets::key_value_row_colored(
+                        ui,
+                        colors,
+                        &crate::t!("ui.ensemble.summary_polyphony"),
+                        &crate::t!(
+                            "ui.ensemble.summary_polyphony_value",
+                            summary.capacity,
+                            summary.instrument_count
+                        ),
+                        value_color,
+                    );
+                    widgets::key_value_row_colored(
+                        ui,
+                        colors,
+                        &crate::t!("ui.ensemble.summary_range"),
+                        &format!(
+                            "{}（{}–{}）",
+                            crate::split::pitch::key_range_text(
+                                summary.lowest_key,
+                                summary.highest_key
+                            ),
+                            summary.lowest_key.unwrap_or_default(),
+                            summary.highest_key.unwrap_or_default()
+                        ),
+                        value_color,
+                    );
+                });
+
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(ensemble_compare_text(target, &summary))
+                    .strong()
+                    .color(value_color),
+            );
+        });
+
         for warning in &self.warnings {
             ui.add_space(6.0);
             widgets::warning_text(ui, colors, warning);
         }
     }
+}
+
+/// 编制汇总的原始数字（界面上直接用这几项，不做别的加工）
+struct EnsembleSummary {
+    /// 件数（只是显示用，容量与音域都不看它）
+    instrument_count: usize,
+    /// 全编制最多能同时发几个音（Σ 每件乐器的同时发音上限）
+    capacity: usize,
+    /// 并集音域下界
+    lowest_key: Option<i32>,
+    /// 并集音域上界
+    highest_key: Option<i32>,
+}
+
+/// 由当前编制算出汇总数字
+///
+/// 口径：全部取**发声音高**。件数用编制长度（与 `ensemble_capacity` 的过滤口径一致：
+/// `enabled` 为假的槽位不参与分轨，也不参与这里的计数）。
+fn ensemble_summary(ensemble: &[EnsembleSlot]) -> EnsembleSummary {
+    let active: Vec<EnsembleSlot> = ensemble
+        .iter()
+        .filter(|slot| slot.enabled)
+        .cloned()
+        .collect();
+    let union: Option<PitchRange> = ensemble_union_range(&active);
+    EnsembleSummary {
+        instrument_count: active.len(),
+        capacity: ensemble_capacity(&active),
+        lowest_key: union.map(|range| range.lo),
+        highest_key: union.map(|range| range.hi),
+    }
+}
+
+/// 编制与源轨评估的对照结果（供文案与配色共用同一套判定）
+struct CoverageVerdict {
+    /// 同时音容量够用
+    polyphony_ok: bool,
+    /// 低音够低
+    low_ok: bool,
+    /// 高音够高
+    high_ok: bool,
+}
+
+impl CoverageVerdict {
+    /// 三项全过才算"盖得住源轨"
+    fn all_ok(&self) -> bool {
+        self.polyphony_ok && self.low_ok && self.high_ok
+    }
+}
+
+/// 逐项判定编制能否覆盖源轨的要求
+fn coverage_verdict(target: &EvaluationReport, summary: &EnsembleSummary) -> CoverageVerdict {
+    CoverageVerdict {
+        polyphony_ok: summary.capacity >= target.max_onset_notes,
+        // 编制并集下界比源轨最低音还高 → 低音区没人演得了
+        low_ok: match (summary.lowest_key, target.lowest_key) {
+            (Some(lowest), Some(target_low)) => lowest <= target_low,
+            _ => true,
+        },
+        high_ok: match (summary.highest_key, target.highest_key) {
+            (Some(highest), Some(target_high)) => highest >= target_high,
+            _ => true,
+        },
+    }
+}
+
+/// 编制与源轨评估的对照文字
+///
+/// 没评估过就提示先评估；评估过则逐项说清"同时音够不够、低音够不够低、高音够不够高"。
+/// 音域只比并集边界，不逐音检查——真正"谁都演不了"的音由分轨阶段的归一化处理并计入报告。
+fn ensemble_compare_text(target: Option<&EvaluationReport>, summary: &EnsembleSummary) -> String {
+    let Some(target) = target else {
+        return crate::t!("ui.ensemble.summary_no_target");
+    };
+
+    let verdict = coverage_verdict(target, summary);
+    let mut lines: Vec<String> = Vec::new();
+
+    if verdict.polyphony_ok {
+        lines.push(crate::t!(
+            "ui.ensemble.compare_polyphony_ok",
+            summary.capacity,
+            target.max_onset_notes,
+            summary.capacity - target.max_onset_notes
+        ));
+    } else {
+        lines.push(crate::t!(
+            "ui.ensemble.compare_polyphony_short",
+            target.max_onset_notes,
+            summary.capacity
+        ));
+    }
+
+    if verdict.low_ok && verdict.high_ok {
+        lines.push(crate::t!("ui.ensemble.compare_range_ok"));
+    }
+    // 音域缺口要点名到具体音，用户才知道往哪个方向补乐器
+    if !verdict.low_ok {
+        if let (Some(lowest), Some(target_low)) = (summary.lowest_key, target.lowest_key) {
+            lines.push(crate::t!(
+                "ui.ensemble.compare_low_short",
+                key_name(target_low),
+                target_low - lowest,
+                key_name(lowest)
+            ));
+        }
+    }
+    if !verdict.high_ok {
+        if let (Some(highest), Some(target_high)) = (summary.highest_key, target.highest_key) {
+            lines.push(crate::t!(
+                "ui.ensemble.compare_high_short",
+                key_name(target_high),
+                highest - target_high,
+                key_name(highest)
+            ));
+        }
+    }
+
+    lines.join("　")
 }
 
 /// 乐器族对应的标签色

@@ -77,6 +77,28 @@ pub fn key_value_row_wide(ui: &mut egui::Ui, colors: &Colors, key: &str, value: 
     key_value_row_with_mode(ui, colors, key, value, egui::TextWrapMode::Wrap);
 }
 
+/// 键值行，值用指定颜色（用于"够用 / 不够用"这类需要一眼看出的数值）
+///
+/// 值同样**截断**（不换行），理由见 [`key_value_row`]：栏宽固定，不能由内容撑开。
+pub fn key_value_row_colored(
+    ui: &mut egui::Ui,
+    colors: &Colors,
+    key: &str,
+    value: &str,
+    value_color: egui::Color32,
+) {
+    ui.label(
+        egui::RichText::new(key)
+            .small()
+            .color(colors.text_secondary),
+    );
+    ui.add(
+        egui::Label::new(egui::RichText::new(value).color(value_color))
+            .wrap_mode(egui::TextWrapMode::Truncate),
+    );
+    ui.end_row();
+}
+
 /// 键值行的实现：指定值的换行模式
 fn key_value_row_with_mode(
     ui: &mut egui::Ui,

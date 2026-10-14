@@ -73,73 +73,15 @@ impl TimbreWeaveApp {
         };
 
         // ---- 卡片 2：处理时间 ----
+        //
+        // 只显示总耗时：分阶段耗时是调试用的，对挑编制没有帮助（它仍然照常统计并写进日志）。
         widgets::card(ui, colors, &crate::t!("ui.report.timing_card"), |ui| {
-            ui.horizontal_wrapped(|ui| {
-                widgets::badge(
-                    ui,
-                    colors,
-                    &crate::t!("ui.report.total_time"),
-                    &duration_text(report.timings.total_micros),
-                );
-                widgets::badge(
-                    ui,
-                    colors,
-                    &crate::t!("ui.report.note_rate"),
-                    &note_rate_text(report.written_notes, report.timings.total_micros),
-                );
-            });
-            ui.add_space(6.0);
-
-            egui::Grid::new("timing_grid")
-                .num_columns(2)
-                .spacing([10.0, 4.0])
-                .show(ui, |ui| {
-                    widgets::key_value_row(
-                        ui,
-                        colors,
-                        &crate::t!("ui.report.timing_read"),
-                        &duration_text(report.timings.read_micros),
-                    );
-                    widgets::key_value_row(
-                        ui,
-                        colors,
-                        &crate::t!("ui.report.timing_grouping"),
-                        &duration_text(report.timings.grouping_micros),
-                    );
-                    widgets::key_value_row(
-                        ui,
-                        colors,
-                        &crate::t!("ui.report.timing_normalize"),
-                        &duration_text(report.timings.normalize_micros),
-                    );
-                    widgets::key_value_row(
-                        ui,
-                        colors,
-                        &crate::t!("ui.report.timing_assign"),
-                        &duration_text(report.timings.assign_micros),
-                    );
-                    widgets::key_value_row(
-                        ui,
-                        colors,
-                        &crate::t!("ui.report.timing_write"),
-                        &duration_text(report.timings.write_micros),
-                    );
-                });
-
-            // 求解占总时间的比例（进度条直观一点）
-            if report.timings.total_micros > 0.0 {
-                let assign_fraction =
-                    (report.timings.assign_micros / report.timings.total_micros) as f32;
-                ui.add_space(4.0);
-                ui.add(
-                    egui::ProgressBar::new(assign_fraction)
-                        .text(crate::t!(
-                            "ui.report.assign_share",
-                            format!("{:.0}", assign_fraction * 100.0)
-                        ))
-                        .desired_width(f32::INFINITY),
-                );
-            }
+            widgets::badge(
+                ui,
+                colors,
+                &crate::t!("ui.report.total_time"),
+                &crate::split::report::StageTimings::format_micros(report.timings.total_micros),
+            );
         });
 
         ui.add_space(8.0);
@@ -351,11 +293,7 @@ impl TimbreWeaveApp {
 
         // 量化档位 → 起始 tick 容差（需要每拍 tick 数，所以这里读一次文件头）
         let onset_tolerance = match crate::midi::reader::load_midi_file(&midi_path) {
-            Ok(loaded) => self
-                .data
-                .quantization
-                .to_fraction()
-                .map(|fraction| (loaded.ticks_per_beat as f64 * fraction).round() as u64),
+            Ok(loaded) => self.data.quantization.onset_tolerance(loaded.ticks_per_beat),
             Err(message) => {
                 self.error_message = Some(message);
                 return;
@@ -383,18 +321,4 @@ impl TimbreWeaveApp {
             }
         }
     }
-}
-
-/// 耗时显示：复用报告层的格式化（<10ms 显示两位小数，<1s 显示整数毫秒，否则显示秒）
-fn duration_text(micros: f64) -> String {
-    crate::split::report::StageTimings::format_micros(micros)
-}
-
-/// 吞吐：每分钟写回多少音符
-fn note_rate_text(written_notes: usize, total_micros: f64) -> String {
-    if total_micros <= 0.0 {
-        return "-".to_string();
-    }
-    let per_minute = written_notes as f64 * 60_000_000.0 / total_micros;
-    format!("{:.0} /min", per_minute)
 }

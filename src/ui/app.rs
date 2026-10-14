@@ -1,6 +1,7 @@
 //! 主窗口与全局状态
 
 use crate::midi::reader::{TrackInfo, load_midi_file, scan_tracks};
+use crate::split::eval::{EvaluationReport, evaluate_tracks};
 use crate::split::instrument::{EnsembleSlot, INSTRUMENT_POOL, assign_channel};
 use crate::split::report::SplitReport;
 use crate::ui::midi_panel::Quantization;
@@ -43,6 +44,8 @@ pub struct TimbreWeaveApp {
     pub data: SplitInputData,
     /// 扫描到的轨道摘要
     pub scanned_tracks: Vec<TrackInfo>,
+    /// 最近一次源轨评估结果（勾选轨道后点"评估"得到）
+    pub evaluation: Option<EvaluationReport>,
     /// 最近一次分轨报告
     pub report: Option<SplitReport>,
     /// 提示信息（成功 / 说明）
@@ -60,6 +63,7 @@ impl Default for TimbreWeaveApp {
         Self {
             data: SplitInputData::default(),
             scanned_tracks: Vec::new(),
+            evaluation: None,
             report: None,
             info_message: None,
             error_message: None,
@@ -84,6 +88,7 @@ impl TimbreWeaveApp {
             self.data.selected_midi_path = Some(path.to_string_lossy().to_string());
             self.scanned_tracks.clear();
             self.data.source_tracks.clear();
+            self.evaluation = None;
             self.error_message = None;
             self.info_message = None;
         }
@@ -92,6 +97,7 @@ impl TimbreWeaveApp {
     /// 扫描所选 midi 的全部轨道
     pub fn scan_tracks(&mut self) {
         self.scanned_tracks.clear();
+        self.evaluation = None;
         self.error_message = None;
         self.info_message = None;
 
@@ -107,6 +113,54 @@ impl TimbreWeaveApp {
                     "msg.scan_done",
                     self.scanned_tracks.len()
                 ));
+            }
+            Err(message) => {
+                self.error_message = Some(message);
+            }
+        }
+    }
+
+    /// 评估当前勾选的源轨：音符总数、最大同时发声数、最低音与最高音
+    ///
+    /// 只读不写：不产生任何文件，也不改动 [`SplitInputData`] 里的任何选择。
+    pub fn evaluate_source_tracks(&mut self) {
+        self.evaluation = None;
+        self.error_message = None;
+        self.info_message = None;
+
+        let Some(path) = self.data.selected_midi_path.clone() else {
+            self.error_message = Some(crate::t!("msg.no_file_selected"));
+            return;
+        };
+        if self.data.source_tracks.is_empty() {
+            self.error_message = Some(crate::t!("msg.no_track_selected"));
+            return;
+        }
+
+        let loaded = match load_midi_file(&path) {
+            Ok(loaded) => loaded,
+            Err(message) => {
+                self.error_message = Some(message);
+                return;
+            }
+        };
+        // 同时发声的口径与分轨一致：用当前量化档位换算出起始 tick 容差
+        let tolerance = self.data.quantization.onset_tolerance(loaded.ticks_per_beat);
+
+        match evaluate_tracks(
+            &loaded,
+            &self.data.source_tracks,
+            self.data.channel_filter,
+            tolerance,
+        ) {
+            Ok(report) => {
+                crate::log_info!(crate::t!(
+                    "log.eval.done",
+                    report.note_count,
+                    report.max_onset_notes,
+                    report.overlap_peak
+                ));
+                self.evaluation = Some(report);
             }
             Err(message) => {
                 self.error_message = Some(message);
@@ -161,20 +215,31 @@ impl eframe::App for TimbreWeaveApp {
 
         // 三栏分栏：左=源 midi，中=编制，右=执行与报告
         //
-        // 左右两栏用**固定宽度（exact_width）+ 禁止拖拽**：报告里有长不可断的字符串
-        // （输出文件全路径、共用通道清单），如果让 SidePanel 按内容自适应宽度，
-        // 右栏会被撑宽并把中间栏挤没。固定宽度后超长文本由换行/裁切处理。
+        // 三栏**等宽**（各占可用宽度的 1/3）。默认布局里左右是固定宽度的 SidePanel、中间是
+        // CentralPanel，窗口拉大时多出来的宽度全归中间栏，左右两栏纹丝不动；所以这里先算后画：
+        // 拿这一帧的可用宽度除以三当目标栏宽，三栏都按这个数排布。
+        //
+        // 宽度口径（见 egui 的 `panel.rs` / `frame.rs`）：
+        // - `SidePanel::exact_width` 是**外框宽度**，内容区要再让出内边距与描边
+        //   （`frame.total_margin()`）；
+        // - 中间栏只能在它那整块画布上把**内容宽度**钉住，且要让出同样一份外框，
+        //   这样三栏的内容区才真正等宽（栏间是面板背景色，外框那几像素看不出来，
+        //   但内容区一旦不等宽，卡片右边就会差出一大截）。
         let colors = self.colors();
-        let side_panel_frame = |fill: egui::Color32| {
-            egui::Frame::new()
-                .fill(fill)
-                .inner_margin(egui::Margin::same(10))
-        };
+        // 面板外框左右各占的宽度：内边距 + 描边（数值与 [`panel_frame`] 一一对应）
+        const PANEL_FRAME_MARGIN: f32 = 1.0 + 10.0;
+        // 窄窗口兜底：再挤就没法看了，此时三栏按这个下限排成一条横向长条（超出部分看不见）
+        const MIN_COLUMN_WIDTH: f32 = 300.0;
+
+        let available_width = ctx.available_rect().width();
+        let column_width = (available_width / 3.0).max(MIN_COLUMN_WIDTH);
+        // 中间栏「内容」的目标宽度：让出与左右两栏相同的外框
+        let central_content_width = (column_width - PANEL_FRAME_MARGIN * 2.0).max(0.0);
 
         egui::SidePanel::left("source_panel")
             .resizable(false)
-            .exact_width(380.0)
-            .frame(side_panel_frame(colors.panel_fill))
+            .exact_width(column_width)
+            .frame(panel_frame(colors.panel_fill))
             .show(ctx, |ui| {
                 // 内容超出栏宽时裁切而不是撑开栏宽
                 ui.set_clip_rect(ui.max_rect());
@@ -183,17 +248,31 @@ impl eframe::App for TimbreWeaveApp {
 
         egui::SidePanel::right("report_panel")
             .resizable(false)
-            .exact_width(440.0)
-            .frame(side_panel_frame(colors.panel_fill))
+            .exact_width(column_width)
+            .frame(panel_frame(colors.panel_fill))
             .show(ctx, |ui| {
                 ui.set_clip_rect(ui.max_rect());
                 self.show_report_panel(ui, &colors);
             });
 
         egui::CentralPanel::default()
-            .frame(side_panel_frame(colors.panel_fill))
-            .show(ctx, |ui| self.show_ensemble_panel(ui, &colors));
+            .frame(panel_frame(colors.panel_fill))
+            .show(ctx, |ui| {
+                // 把内容宽度钉在等宽口径上（`set_width` = 同时设最小与最大宽度）
+                ui.set_width(central_content_width);
+                self.show_ensemble_panel(ui, &colors);
+            });
     }
+}
+
+/// 三栏面板的统一外框：同一份背景色 + 同一套留白
+///
+/// 三个面板必须用**同一个**外框，否则栏与栏之间的视觉分界会漂移；
+/// `update` 里的常量 `PANEL_FRAME_MARGIN` 就是这份外框左右各占的宽度。
+fn panel_frame(fill: egui::Color32) -> egui::Frame {
+    egui::Frame::new()
+        .fill(fill)
+        .inner_margin(egui::Margin::same(10))
 }
 
 /// 顶栏主题切换按钮

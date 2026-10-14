@@ -49,6 +49,14 @@ impl Quantization {
             Quantization::OneThirtySecond => crate::t!("ui.midi.quantization.thirty_second"),
         }
     }
+
+    /// 换算成起始 tick 容差（需要文件头的"每拍 tick 数"）
+    ///
+    /// 分轨与评估共用这一个换算，两边的"同时发声"口径才不会漂移。
+    pub fn onset_tolerance(&self, ticks_per_beat: u16) -> crate::midi::grouping::OnsetTolerance {
+        self.to_fraction()
+            .map(|fraction| (ticks_per_beat as f64 * fraction).round() as u64)
+    }
 }
 
 impl TimbreWeaveApp {
@@ -127,6 +135,8 @@ impl TimbreWeaveApp {
                                 .clicked()
                             {
                                 self.data.channel_filter = -1;
+                                // 通道过滤变了，评估结果里的音符数就不再对应当前设置
+                                self.evaluation = None;
                             }
                             for channel_index in 0..16 {
                                 if ui
@@ -137,6 +147,7 @@ impl TimbreWeaveApp {
                                     .clicked()
                                 {
                                     self.data.channel_filter = channel_index;
+                                    self.evaluation = None;
                                 }
                             }
                         });
@@ -155,6 +166,8 @@ impl TimbreWeaveApp {
                                     .clicked()
                                 {
                                     self.data.quantization = quantization;
+                                    // 量化档位决定"多近算同时发声"，评估结果随之失效
+                                    self.evaluation = None;
                                 }
                             }
                         });
@@ -215,15 +228,108 @@ impl TimbreWeaveApp {
                                                 .source_tracks
                                                 .retain(|index| *index != track_index);
                                         }
+                                        // 勾选变了，上一次的评估结果不再对应当前选择
+                                        self.evaluation = None;
                                     }
                                     ui.end_row();
                                 }
                             });
                     });
+
+                // 勾完源轨后先评估一下，再挑编制：挑乐器的两个依据（同时音容量、音域）
+                // 就是评估给出的数字
+                ui.add_space(6.0);
+                if ui
+                    .add_enabled(
+                        selected_count > 0,
+                        egui::Button::new(crate::t!("ui.midi.evaluate")),
+                    )
+                    .on_hover_text(crate::t!("ui.midi.evaluate_hint"))
+                    .clicked()
+                {
+                    self.evaluate_source_tracks();
+                }
             },
         );
 
         ui.add_space(8.0);
+
+        // ---- 卡片 4：评估结果（点过"评估"才出现） ----
+        if let Some(evaluation) = &self.evaluation {
+            widgets::card(ui, colors, &crate::t!("ui.midi.eval_card"), |ui| {
+                egui::Grid::new("eval_grid")
+                    .num_columns(2)
+                    .spacing([10.0, 4.0])
+                    .show(ui, |ui| {
+                        widgets::key_value_row(
+                            ui,
+                            colors,
+                            &crate::t!("ui.midi.eval_notes"),
+                            &evaluation.note_count.to_string(),
+                        );
+                        widgets::key_value_row(
+                            ui,
+                            colors,
+                            &crate::t!("ui.midi.eval_onset_peak"),
+                            &evaluation.max_onset_notes.to_string(),
+                        );
+                        widgets::key_value_row(
+                            ui,
+                            colors,
+                            &crate::t!("ui.midi.eval_overlap_peak"),
+                            &evaluation.overlap_peak.to_string(),
+                        );
+
+                        ui.label(
+                            egui::RichText::new(crate::t!("ui.midi.eval_range"))
+                                .small()
+                                .color(colors.text_secondary),
+                        );
+                        match (evaluation.lowest_key, evaluation.highest_key) {
+                            (Some(lowest), Some(highest)) => {
+                                ui.label(format!(
+                                    "{}（{}–{}）",
+                                    crate::split::pitch::key_range_text(Some(lowest), Some(highest)),
+                                    lowest,
+                                    highest
+                                ));
+                            }
+                            _ => {
+                                ui.label("-");
+                            }
+                        }
+                        ui.end_row();
+                    });
+
+                // 说明文本：让用户知道这两个"同时音"数字各自是什么意思
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(crate::t!("ui.midi.eval_onset_note"))
+                        .small()
+                        .color(colors.text_secondary),
+                );
+                ui.label(
+                    egui::RichText::new(crate::t!("ui.midi.eval_overlap_note"))
+                        .small()
+                        .color(colors.text_secondary),
+                );
+
+                if !evaluation.onset_size_counts.is_empty() {
+                    ui.add_space(4.0);
+                    widgets::section_label(ui, colors, &crate::t!("ui.midi.eval_distribution"));
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(evaluation.onset_size_text())
+                                .small()
+                                .color(colors.text_primary),
+                        )
+                        .wrap_mode(egui::TextWrapMode::Wrap),
+                    );
+                }
+            });
+
+            ui.add_space(8.0);
+        }
 
         // ---- 提示信息 ----
         if let Some(message) = &self.info_message {
